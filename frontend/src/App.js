@@ -1,0 +1,15 @@
+// App.js - Main React App Component
+
+import React from 'react';
+import VoiceAssistant from './components/VoiceAssistant';
+import './App.css';
+
+function App() {
+  return (
+    <div className="App">
+      <VoiceAssistant />
+    </div>
+  );
+}
+
+export default App;
