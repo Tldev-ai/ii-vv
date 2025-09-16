@@ -1,7 +1,14 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Mic, MicOff, MessageCircle, Phone, PhoneOff } from 'lucide-react';
+import { Mic, MicOff, MessageCircle, PhoneOff } from 'lucide-react';
+
+/**
+ * VoiceAssistant
+ * - One-click start -> greet -> auto listen/reply loop
+ * - Slot filling then auto-end
+ */
 
 const VoiceAssistant = () => {
+  // ---- visible state ----
   const [isConnected, setIsConnected] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -9,233 +16,490 @@ const VoiceAssistant = () => {
   const [connectionStatus, setConnectionStatus] = useState('Disconnected');
   const [transcript, setTranscript] = useState('');
   const [conversation, setConversation] = useState([]);
-  
+
+  // ---- refs ----
   const wsRef = useRef(null);
+  const recognitionRef = useRef(null);
   const currentUtteranceRef = useRef(null);
 
+  const finalTextRef = useRef('');
+  const sessionActiveRef = useRef(false);
+  const pausedByStopRef = useRef(false);
+  const startAfterTTSRef = useRef(false);
+  const greetHardCapTimerRef = useRef(null);
+  const speakWatchdogRef = useRef(null);
+  const startingListenRef = useRef(false);
+  const lastListenStartAtRef = useRef(0);
+  const currentUserBubbleIndexRef = useRef(null);
+  const heardThisTurnRef = useRef(false);
+
+  const inactivityTimerRef = useRef(null);
+  const hangTimerRef = useRef(null);
+
+  // ---- slot filling state ----
+  const [intent, setIntent] = useState(null); // 'home_tuition' | 'coaching'
+  const [slots, setSlots] = useState({
+    track: null,       // 'home_tuition' | 'coaching'
+    name: null,
+    grade: null,
+    board: null,       // CBSE/ICSE/IGCSE/IB/State
+    location: null,    // city/area | 'Online'
+    budget: null,      // optional
+    teacherReq: null,  // preferences text (optional)
+  });
+  const askedSlotRef = useRef(null); // tracks the slot we just asked, to avoid re-asking
+
+  // ===== connection (mock/no-op) =====
   const connectToOpenAI = async () => {
     try {
       setConnectionStatus('Connecting...');
-      
-      const mockWs = {
+      wsRef.current = {
         readyState: WebSocket.OPEN,
-        send: (data) => {
-          console.log('Sending to AI:', data);
-        },
-        close: () => {
-          setIsConnected(false);
-          setConnectionStatus('Disconnected');
-        }
+        send: (d) => console.log('WS send:', d),
+        close: () => { setIsConnected(false); setConnectionStatus('Disconnected'); }
       };
-      
-      wsRef.current = mockWs;
       setIsConnected(true);
       setConnectionStatus('Connected');
-      
-      // Welcome message
-      setConversation([{
-        type: 'assistant',
-        message: 'Hello! Welcome to iiTuitions. I\'m here to help you find the perfect tutoring for your IIT-JEE preparation. What are you looking for today?',
-        timestamp: new Date().toLocaleTimeString()
-      }]);
-
-      // Start speaking welcome message
-      setTimeout(() => {
-        const now = new Date();
-        const hour = now.getHours();
-        let greeting = hour < 12 ? "Good morning!" : hour < 17 ? "Good afternoon!" : "Good evening!";
-        
-        const welcomeMessage = `${greeting} Welcome to iiTuitions! I'm here to help you with your IIT-JEE preparation. We offer personalized 1-on-1 mentorship by IIT and NIT alumni. What would you like to know about our program?`;
-        
-        handleAIResponse(welcomeMessage);
-      }, 1000);
-      
-    } catch (error) {
-      console.error('Connection failed:', error);
+    } catch (e) {
+      console.error('connect error', e);
       setConnectionStatus('Connection Failed');
     }
   };
 
-  const disconnectFromOpenAI = () => {
-    // Stop any ongoing speech
-    if (currentUtteranceRef.current) {
-      speechSynthesis.cancel();
-      setIsSpeaking(false);
-    }
-    
-    if (wsRef.current) {
-      wsRef.current.close();
-    }
-    
+  const endChat = () => {
+    // stop TTS
+    try { window.speechSynthesis.cancel(); } catch {}
+    setIsSpeaking(false);
+    currentUtteranceRef.current = null;
+
+    // stop SR
+    try { recognitionRef.current?.stop(); } catch {}
+    recognitionRef.current = null;
+    setIsListening(false);
+
+    // timers
+    if (speakWatchdogRef.current) { clearInterval(speakWatchdogRef.current); speakWatchdogRef.current = null; }
+    if (greetHardCapTimerRef.current) { clearTimeout(greetHardCapTimerRef.current); greetHardCapTimerRef.current = null; }
+    if (inactivityTimerRef.current) { clearTimeout(inactivityTimerRef.current); inactivityTimerRef.current = null; }
+    if (hangTimerRef.current) { clearTimeout(hangTimerRef.current); hangTimerRef.current = null; }
+
+    // ws
+    try { wsRef.current?.close(); } catch {}
+    wsRef.current = null;
+
     setIsConnected(false);
     setConnectionStatus('Disconnected');
-    setTranscript('');
-    setIsListening(false);
-    setIsProcessing(false);
+
+    // session flags
+    sessionActiveRef.current = false;
+    pausedByStopRef.current = false;
+    startAfterTTSRef.current = false;
+    startingListenRef.current = false;
+    lastListenStartAtRef.current = 0;
+    currentUserBubbleIndexRef.current = null;
+    heardThisTurnRef.current = false;
+
+    // reset slots for next call
+    setIntent(null);
+    setSlots({
+      track: null, name: null, grade: null, board: null, location: null, budget: null, teacherReq: null
+    });
+    askedSlotRef.current = null;
   };
 
-  const startListening = async () => {
+  useEffect(() => () => endChat(), []); // cleanup on unmount
+
+  // ===== utils =====
+  function timeGreeting() {
+    const h = new Date().getHours();
+    if (h < 12) return 'Good morning';
+    if (h < 17) return 'Good afternoon';
+    return 'Good evening';
+  }
+
+  async function warmupMicPermission() {
     try {
-      setIsListening(true);
-      
-      // Add user message showing we're listening
-      setConversation(prev => [...prev, {
-        type: 'user',
-        message: 'Listening...',
-        timestamp: new Date().toLocaleTimeString()
-      }]);
-      
-      // Simulate voice input after 3 seconds
-      setTimeout(() => {
-        const mockUserMessages = [
-          "What programs do you offer?",
-          "How much does it cost?", 
-          "I need help with Physics",
-          "Tell me about your mentors",
-          "I'm in 12th grade preparing for JEE",
-          "What's your success rate?",
-          "I am looking for a tuition for him"
-        ];
-        
-        const randomMessage = mockUserMessages[Math.floor(Math.random() * mockUserMessages.length)];
-        setTranscript(randomMessage);
-        
-        // Update the listening message with actual response
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      s.getTracks().forEach(t => t.stop());
+      return true;
+    } catch (e) {
+      console.warn('Mic permission denied:', e);
+      return false;
+    }
+  }
+
+  // ===== inactivity (2m -> warn, +15s -> hang) =====
+  function scheduleInactivity() {
+    if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+    if (hangTimerRef.current) clearTimeout(hangTimerRef.current);
+
+    inactivityTimerRef.current = setTimeout(() => {
+      speakAndLog("Are you there, ma'am/sir? I'm not hearing your voice.");
+      hangTimerRef.current = setTimeout(() => {
+        speakAndLog("I'll end the call for now. You can reconnect anytime.");
+        setTimeout(endChat, 900);
+      }, 15000);
+    }, 120000);
+  }
+  function clearInactivity() {
+    if (inactivityTimerRef.current) { clearTimeout(inactivityTimerRef.current); inactivityTimerRef.current = null; }
+    if (hangTimerRef.current) { clearTimeout(hangTimerRef.current); hangTimerRef.current = null; }
+  }
+
+  // ===== one-click start =====
+  const onAskClick = async () => {
+    if (!isConnected) await connectToOpenAI();
+
+    // If paused via Stop, just resume listening (no re-greet)
+    if (sessionActiveRef.current && pausedByStopRef.current) {
+      pausedByStopRef.current = false;
+      startListeningSafe();
+      return;
+    }
+
+    if (!sessionActiveRef.current) {
+      const ok = await warmupMicPermission();
+      if (!ok) { alert('Please allow microphone access.'); return; }
+
+      sessionActiveRef.current = true;
+      pausedByStopRef.current = false;
+      startAfterTTSRef.current = true;
+
+      speakAndLog(`${timeGreeting()} ma'am/sir. How can I help you today?`);
+
+      // Hard cap: if no onend (buggy browsers), force start after 3.5s
+      if (greetHardCapTimerRef.current) clearTimeout(greetHardCapTimerRef.current);
+      greetHardCapTimerRef.current = setTimeout(() => {
+        if (!sessionActiveRef.current || pausedByStopRef.current) return;
+        if (!isListening && !isSpeaking && !isProcessing) startListeningSafe();
+      }, 3500);
+      return;
+    }
+
+    if (!isSpeaking && !isProcessing && !isListening) startListeningSafe();
+  };
+
+  // ===== Stop button: pause loop =====
+  const onStopClick = () => {
+    pausedByStopRef.current = true;
+
+    try { window.speechSynthesis.cancel(); } catch {}
+    setIsSpeaking(false);
+    currentUtteranceRef.current = null;
+
+    try { recognitionRef.current?.stop(); } catch {}
+    recognitionRef.current = null;
+    setIsListening(false);
+
+    clearInactivity();
+  };
+
+  // ===== Speech Recognition =====
+  function ensureRecognition() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { alert('SpeechRecognition not supported (use Chrome).'); return null; }
+    const rec = new SR();
+    rec.lang = 'en-IN';
+    rec.interimResults = true;
+    rec.continuous = false;
+    rec.maxAlternatives = 1;
+    return rec;
+  }
+
+  function startListeningSafe() {
+    if (!sessionActiveRef.current) return;
+    if (pausedByStopRef.current) return;
+    if (isSpeaking || isProcessing) return;
+
+    const now = Date.now();
+    if (startingListenRef.current) return;
+    if (isListening) return;
+    if (recognitionRef.current) return;
+    if (now - lastListenStartAtRef.current < 400) return;
+
+    startingListenRef.current = true;
+    lastListenStartAtRef.current = now;
+    setTimeout(startListeningCore, 120);
+  }
+
+  function startListeningCore() {
+    if (!sessionActiveRef.current || pausedByStopRef.current) { startingListenRef.current = false; return; }
+
+    const rec = ensureRecognition();
+    if (!rec) { startingListenRef.current = false; return; }
+
+    recognitionRef.current = rec;
+    setIsListening(true);
+    setTranscript('');
+    finalTextRef.current = '';
+    heardThisTurnRef.current = false;
+    currentUserBubbleIndexRef.current = null;
+
+    scheduleInactivity();
+
+    rec.onresult = (e) => {
+      scheduleInactivity();
+      let finalText = '';
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += t; else interim += t;
+      }
+      const show = (finalText || interim || '').trim();
+      setTranscript(show);
+      if (finalText) finalTextRef.current = finalText.trim();
+
+      if (!heardThisTurnRef.current) {
+        heardThisTurnRef.current = true;
+        const stamp = new Date().toLocaleTimeString();
         setConversation(prev => {
-          const newConv = [...prev];
-          newConv[newConv.length - 1].message = randomMessage;
-          return newConv;
+          const next = [...prev, { type: 'user', message: show || '…', timestamp: stamp }];
+          currentUserBubbleIndexRef.current = next.length - 1;
+          return next;
         });
-        
-        setIsListening(false);
-        processUserInput(randomMessage);
-      }, 3000);
-      
-    } catch (error) {
-      console.error('Error:', error);
+      } else {
+        setConversation(prev => {
+          const next = [...prev];
+          const idx = currentUserBubbleIndexRef.current;
+          if (idx != null && next[idx]) next[idx].message = show || next[idx].message;
+          return next;
+        });
+      }
+    };
+
+    rec.onerror = () => {
       setIsListening(false);
-    }
+      recognitionRef.current = null;
+      startingListenRef.current = false;
+    };
+
+    rec.onend = () => {
+      setIsListening(false);
+      recognitionRef.current = null;
+      startingListenRef.current = false;
+      clearInactivity();
+
+      const text = (finalTextRef.current || transcript || '').trim();
+      if (!text) {
+        if (sessionActiveRef.current && !pausedByStopRef.current) {
+          setTimeout(startListeningSafe, 600);
+        }
+        return;
+      }
+      setIsProcessing(true);
+      handleUserText(text);
+    };
+
+    rec.start();
+  }
+
+  // ===== Slot filling logic =====
+  const order = ['track', 'name', 'grade', 'board', 'location', 'budget', 'teacherReq'];
+  const prompts = {
+    track: "Do you need home tuitions (online/offline) or IIT/SAT coaching?",
+    name: "May I have the student's or the parent's name?",
+    grade: "Which grade is the student in?",
+    board: "Which board? (CBSE / ICSE / IGCSE / IB / State)",
+    location: "Which location or city are you in? You can also say Online.",
+    budget: "Any budget range in mind (per hour or per month)? This is optional.",
+    teacherReq: "Any teacher preferences? (gender, experience, language, timings) You can say 'no preference'.",
   };
 
-  const processUserInput = (message) => {
-    setIsProcessing(true);
-    
-    setTimeout(() => {
-      const response = generateResponse(message);
-      handleAIResponse(response);
-    }, 1500);
-  };
+  function detectIntentFrom(text) {
+    const t = text.toLowerCase();
+    if (t.includes('home tuition') || t.includes('home tuitions') || t.includes('offline') || t.includes('teacher at home')) {
+      return 'home_tuition';
+    }
+    if (t.includes('iit') || t.includes('jee') || t.includes('sat')) return 'coaching';
+    return null;
+  }
 
-  const generateResponse = (userMessage) => {
-    const lowerMessage = userMessage.toLowerCase();
-    
-    // Handle stop commands
-    if (lowerMessage.includes('stop') || lowerMessage.includes('enough') || lowerMessage.includes('quiet')) {
-      return "I'll stop talking now. Just let me know when you'd like to continue our conversation!";
-    }
-    
-    // Friendly responses about iiTuitions
-    if (lowerMessage.includes('program') || lowerMessage.includes('offer') || lowerMessage.includes('service')) {
-      return "We offer personalized 1-on-1 mentorship for IIT-JEE preparation. Our mentors are IIT and NIT alumni who provide customized study plans, daily progress tracking, and unlimited doubt clearing. Each student gets a dedicated mentor who understands their unique learning style.";
-    }
-    
-    if (lowerMessage.includes('cost') || lowerMessage.includes('price') || lowerMessage.includes('fee')) {
-      return "Our fees depend on the program you choose. We have different packages for Mains and Advanced preparation. The investment ranges from 800 to 1500 rupees per hour, but we also offer package deals with significant discounts. Would you like me to connect you with our counselor for detailed pricing?";
-    }
-    
-    if (lowerMessage.includes('physics') || lowerMessage.includes('chemistry') || lowerMessage.includes('math')) {
-      return "Subject-specific help is our specialty! Our mentors are experts in Physics, Chemistry, and Mathematics. We focus on both concept clarity and problem-solving techniques. We also provide numerical practice packs and regular assessments to track your progress.";
-    }
-    
-    if (lowerMessage.includes('mentor') || lowerMessage.includes('teacher')) {
-      return "All our mentors are IIT and NIT graduates with proven track records. They provide 1-on-1 personalized attention, which means the teaching pace and style is completely adapted to your needs. You'll have direct access to your mentor for doubts and guidance.";
-    }
-    
-    if (lowerMessage.includes('12th') || lowerMessage.includes('11th') || lowerMessage.includes('grade')) {
-      return "Perfect! We have specialized programs for both 11th and 12th grade students. For 12th graders, we focus on intensive JEE preparation with crash courses if needed. For 11th graders, we build a strong foundation while keeping pace with the syllabus.";
-    }
-    
-    if (lowerMessage.includes('success') || lowerMessage.includes('result')) {
-      return "We're proud of our results! Many of our students have secured ranks under AIR 500, and our success rate for JEE qualification is over 85%. We provide a score improvement guarantee - if you don't see improvement, we refund your fees.";
-    }
-    
-    if (lowerMessage.includes('tuition') || lowerMessage.includes('looking for')) {
-      return "That's wonderful! Finding the right tuition is crucial for JEE success. At iiTuitions, we don't just teach - we mentor. Could you tell me a bit more about what you're looking for? Which grade is the student in, and what are the main challenges they're facing?";
-    }
-    
-    // Default friendly response
-    return "That sounds interesting! At iiTuitions, we specialize in personalized IIT-JEE coaching with 1-on-1 mentorship. Our IIT and NIT alumni mentors provide customized guidance based on each student's needs. Would you like to know more about any specific aspect of our program?";
-  };
+  function fillSlotsFrom(text, current) {
+    const out = { ...current };
+    const t = text || '';
+    const lower = t.toLowerCase();
 
-  const handleAIResponse = (responseText) => {
+    // track
+    const maybeIntent = detectIntentFrom(text);
+    if (!out.track && maybeIntent) out.track = maybeIntent;
+
+    // name
+    if (!out.name) {
+      const m = t.match(/\b(my name is|this is|i am)\s+([a-z .'-]{2,})/i);
+      if (m) out.name = m[2].trim();
+    }
+
+    // grade
+    if (!out.grade) {
+      const m = lower.match(/\b(?:grade|class)\s*(\d{1,2})\b/);
+      if (m) out.grade = m[1];
+    }
+
+    // board
+    if (!out.board) {
+      const m = lower.match(/\b(cbse|icse|igcse|ib|state)\b/);
+      if (m) out.board = m[1].toUpperCase();
+    }
+
+    // location
+    if (!out.location) {
+      if (/\bonline\b/i.test(t)) out.location = 'Online';
+      else {
+        const m = t.match(/\b(?:in|at)\s+([a-z0-9 .,'-]{3,})$/i);
+        if (m) out.location = m[1].trim();
+      }
+    }
+
+    // budget
+    if (!out.budget) {
+      const m = t.match(/(?:₹\s*|rs\.?\s*)?(\d{3,6})(?:\s*(?:per|\/)\s*(hour|month))?/i);
+      if (m) out.budget = m[0].replace(/\s+/g, ' ');
+    }
+
+    // teacher requirements (keywords)
+    if (!out.teacherReq && /(female|male|experience|years|language|timing|evening|morning|weekend|weekday|no preference)/i.test(t)) {
+      out.teacherReq = t.trim();
+    }
+
+    return out;
+  }
+
+  function nextMissingSlot(s) {
+    for (const k of order) {
+      if (!s[k]) return k;
+    }
+    return null;
+  }
+
+  function summarize(s) {
+    const gradeStr = s.grade ? `grade ${s.grade}` : 'grade -';
+    const boardStr = s.board || '-';
+    const locStr = s.location || '-';
+    const budStr = s.budget || '-';
+    const prefStr = s.teacherReq || '-';
+    const who = s.name ? `Thanks ${s.name}. ` : 'Thanks. ';
+    const trackStr = s.track === 'home_tuition' ? 'Home Tuitions' : 'IIT/SAT coaching';
+    return `${who}I noted ${trackStr}: ${gradeStr}, board ${boardStr}, location ${locStr}, budget ${budStr}, preferences: ${prefStr}. We will get back to you soon. Ending the call now.`;
+  }
+
+  function handleUserText(text) {
+    // Fill from user text
+    const updatedSlots = fillSlotsFrom(text, { ...slots });
+    if (!intent) {
+      const d = detectIntentFrom(text);
+      if (d) setIntent(d);
+      if (updatedSlots.track && !intent) setIntent(updatedSlots.track === 'home_tuition' ? 'home_tuition' : 'coaching');
+    }
+    setSlots(updatedSlots);
+
+    // If we just asked a slot and user answered, clear askedSlot marker
+    if (askedSlotRef.current && updatedSlots[askedSlotRef.current]) {
+      askedSlotRef.current = null;
+    }
+
+    // Decide next step
+    const missing = nextMissingSlot(updatedSlots);
+    if (missing) {
+      // avoid repeating same prompt twice in a row
+      if (askedSlotRef.current === missing) {
+        // User didn't answer; ask a gentle rephrase
+        const reask = missing === 'track'
+          ? "Do you prefer home tuitions or IIT/SAT coaching?"
+          : prompts[missing];
+        speakAndLog(reask);
+      } else {
+        askedSlotRef.current = missing;
+        speakAndLog(prompts[missing]);
+      }
+      return;
+    }
+
+    // All collected → summarize and end call
+    const msg = summarize(updatedSlots);
+    speakAndLog(msg);
+
+    // End after TTS
+    const endAfter = () => setTimeout(endChat, 1000);
+    // attach one-time ender using a short TTS (so we don't rely on onend here)
+    setTimeout(endAfter, 2500); // safety: in case onend/watchdog took longer
+  }
+
+  // ===== TTS helpers =====
+  function speakAndLog(text) {
     setIsProcessing(false);
     setIsSpeaking(true);
-    
-    // Add AI response to conversation
-    setConversation(prev => [...prev, {
-      type: 'assistant',
-      message: responseText,
-      timestamp: new Date().toLocaleTimeString()
-    }]);
-    
-    // Speak the response
-    try {
-      speechSynthesis.cancel(); // Stop any ongoing speech
-      
-      const utterance = new SpeechSynthesisUtterance(responseText);
-      utterance.rate = 0.9;
-      utterance.pitch = 1;
-      utterance.volume = 1;
-      
-      currentUtteranceRef.current = utterance;
-      
-      utterance.onend = () => {
-        setIsSpeaking(false);
-        currentUtteranceRef.current = null;
-      };
-      
-      utterance.onerror = (error) => {
-        console.error('Speech error:', error);
-        setIsSpeaking(false);
-        currentUtteranceRef.current = null;
-      };
-      
-      speechSynthesis.speak(utterance);
-      
-    } catch (error) {
-      console.error('Text-to-speech error:', error);
-      setIsSpeaking(false);
-    }
-  };
 
-  // Stop speaking when user says stop
-  useEffect(() => {
-    if (transcript.toLowerCase().includes('stop') && isSpeaking) {
-      speechSynthesis.cancel();
+    setConversation(prev => [
+      ...prev,
+      { type: 'assistant', message: text, timestamp: new Date().toLocaleTimeString() }
+    ]);
+
+    try {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 0.95; u.pitch = 1;
+
+      currentUtteranceRef.current = u;
+
+      const startListen = () => {
+        if (speakWatchdogRef.current) { clearInterval(speakWatchdogRef.current); speakWatchdogRef.current = null; }
+        if (greetHardCapTimerRef.current) { clearTimeout(greetHardCapTimerRef.current); greetHardCapTimerRef.current = null; }
+
+        setIsSpeaking(false);
+        currentUtteranceRef.current = null;
+
+        if (pausedByStopRef.current) return;
+
+        if (startAfterTTSRef.current) startAfterTTSRef.current = false;
+
+        if (sessionActiveRef.current) {
+          scheduleInactivity();
+          startListeningSafe();
+        }
+      };
+
+      u.onend = startListen;
+      u.onerror = startListen;
+
+      window.speechSynthesis.speak(u);
+
+      // Watchdog (covers missing onend)
+      if (speakWatchdogRef.current) clearInterval(speakWatchdogRef.current);
+      speakWatchdogRef.current = setInterval(() => {
+        const speaking = window?.speechSynthesis?.speaking;
+        if (!speaking) startListen();
+      }, 300);
+    } catch (e) {
+      console.error('TTS error', e);
       setIsSpeaking(false);
       currentUtteranceRef.current = null;
-      
-      // Add a brief acknowledgment
-      setTimeout(() => {
-        handleAIResponse("Sure, I've stopped. What would you like to know?");
-      }, 500);
+      if (!pausedByStopRef.current && sessionActiveRef.current) {
+        scheduleInactivity();
+        startListeningSafe();
+      }
     }
-  }, [transcript, isSpeaking]);
+  }
 
+  // ===== UI helpers =====
   const getStatusColor = () => {
     if (isListening) return 'bg-red-500';
     if (isProcessing) return 'bg-yellow-500';
     if (isSpeaking) return 'bg-blue-500';
     if (isConnected) return 'bg-green-500';
-    return 'bg-gray-500';
+    return 'bg-gray-400';
   };
-
   const getStatusText = () => {
+    if (!sessionActiveRef.current) return 'Idle';
+    if (pausedByStopRef.current) return 'Paused';
     if (isListening) return 'Listening...';
     if (isProcessing) return 'Processing...';
     if (isSpeaking) return 'Speaking...';
-    if (isConnected) return 'Ready to help';
-    return connectionStatus;
+    return 'Idle';
+  };
+
+  // ===== greet once then listen =====
+  const onComponentAsk = async () => {
+    await onAskClick();
   };
 
   return (
@@ -244,95 +508,71 @@ const VoiceAssistant = () => {
         {/* Header */}
         <div className="text-center mb-8">
           <h1 className="text-3xl font-bold text-gray-800 mb-2">iiTuitions Assistant</h1>
-          <p className="text-gray-600">Your friendly guide to IIT-JEE success</p>
+          <p className="text-gray-600">Your friendly guide to IIT-JEE & Home Tuitions</p>
         </div>
 
-        {/* Main Interface */}
+        {/* Main card */}
         <div className="bg-white rounded-xl shadow-lg p-8 mb-6">
-          {/* Status Indicator */}
+          {/* Status */}
           <div className="flex items-center justify-center mb-6">
-            <div className={`w-4 h-4 rounded-full ${getStatusColor()} mr-3`}></div>
+            <div className={`w-3 h-3 rounded-full ${getStatusColor()} mr-3`}></div>
             <span className="text-lg font-medium text-gray-700">{getStatusText()}</span>
           </div>
 
-          {/* Control Buttons */}
-          <div className="flex justify-center space-x-4 mb-8">
-            {!isConnected ? (
-              <button
-                onClick={connectToOpenAI}
-                className="bg-green-500 hover:bg-green-600 text-white px-6 py-3 rounded-lg font-medium flex items-center space-x-2 transition-colors"
-              >
-                <Phone size={20} />
-                <span>Start Chat</span>
-              </button>
-            ) : (
-              <>
-                <button
-                  onClick={startListening}
-                  disabled={isProcessing || isSpeaking || isListening}
-                  className="bg-blue-500 hover:bg-blue-600 disabled:bg-gray-400 text-white px-6 py-3 rounded-lg font-medium flex items-center space-x-2 transition-colors"
-                >
-                  <Mic size={20} />
-                  <span>Ask Question</span>
-                </button>
-                
-                <button
-                  onClick={() => {
-                    if (isSpeaking) {
-                      speechSynthesis.cancel();
-                      setIsSpeaking(false);
-                      currentUtteranceRef.current = null;
-                    }
-                  }}
-                  disabled={!isSpeaking}
-                  className="bg-red-500 hover:bg-red-600 disabled:bg-gray-400 text-white px-6 py-3 rounded-lg font-medium flex items-center space-x-2 transition-colors"
-                >
-                  <MicOff size={20} />
-                  <span>Stop</span>
-                </button>
-                
-                <button
-                  onClick={disconnectFromOpenAI}
-                  className="bg-gray-500 hover:bg-gray-600 text-white px-6 py-3 rounded-lg font-medium flex items-center space-x-2 transition-colors"
-                >
-                  <PhoneOff size={20} />
-                  <span>End Chat</span>
-                </button>
-              </>
-            )}
+          {/* Controls */}
+          <div className="flex justify-center gap-4 mb-8">
+            <button
+              onClick={onComponentAsk}
+              disabled={isProcessing || isSpeaking}
+              className="bg-blue-500 hover:bg-blue-600 disabled:bg-gray-400 text-white px-6 py-3 rounded-lg font-medium flex items-center gap-2 transition-colors"
+            >
+              <Mic size={18} />
+              Ask Question
+            </button>
+
+            <button
+              onClick={onStopClick}
+              disabled={(!isSpeaking && !isListening) && !sessionActiveRef.current}
+              className="bg-red-500 hover:bg-red-600 disabled:bg-gray-400 text-white px-6 py-3 rounded-lg font-medium flex items-center gap-2 transition-colors"
+            >
+              <MicOff size={18} />
+              Stop
+            </button>
+
+            <button
+              onClick={endChat}
+              className="bg-gray-600 hover:bg-gray-700 text-white px-6 py-3 rounded-lg font-medium flex items-center gap-2 transition-colors"
+            >
+              <PhoneOff size={18} />
+              End Chat
+            </button>
           </div>
 
-          {/* Live Transcript */}
+          {/* Live transcript */}
           {transcript && (
-            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
-              <h3 className="font-medium text-blue-800 mb-2">You said:</h3>
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <h3 className="font-medium text-blue-800 mb-1">You said:</h3>
               <p className="text-blue-700">{transcript}</p>
             </div>
           )}
         </div>
 
-        {/* Conversation History */}
+        {/* Conversation */}
         {conversation.length > 0 && (
           <div className="bg-white rounded-xl shadow-lg p-6">
             <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center">
-              <MessageCircle className="mr-2" size={24} />
+              <MessageCircle className="mr-2" size={22} />
               Conversation
             </h2>
-            
+
             <div className="space-y-4 max-h-96 overflow-y-auto">
-              {conversation.map((msg, index) => (
+              {conversation.map((msg, i) => (
                 <div
-                  key={index}
-                  className={`p-4 rounded-lg ${
-                    msg.type === 'user' 
-                      ? 'bg-blue-100 ml-8' 
-                      : 'bg-gray-100 mr-8'
-                  }`}
+                  key={i}
+                  className={`p-4 rounded-lg ${msg.type === 'user' ? 'bg-blue-100 ml-8' : 'bg-gray-100 mr-8'}`}
                 >
                   <div className="flex justify-between items-start mb-1">
-                    <span className={`font-medium ${
-                      msg.type === 'user' ? 'text-blue-800' : 'text-gray-800'
-                    }`}>
+                    <span className={`font-medium ${msg.type === 'user' ? 'text-blue-800' : 'text-gray-800'}`}>
                       {msg.type === 'user' ? 'You' : 'iiTuitions Assistant'}
                     </span>
                     <span className="text-xs text-gray-500">{msg.timestamp}</span>
@@ -344,12 +584,11 @@ const VoiceAssistant = () => {
           </div>
         )}
 
-        {/* Quick Info */}
+        {/* Info */}
         <div className="mt-8 bg-blue-50 border border-blue-200 rounded-lg p-6">
-          <h3 className="font-bold text-blue-800 mb-2">About iiTuitions:</h3>
+          <h3 className="font-bold text-blue-800 mb-2">About iiTuitions</h3>
           <p className="text-blue-700">
-            Personalized 1-on-1 IIT-JEE mentorship by IIT/NIT alumni. 
-            Ask me about our programs, pricing, mentors, or anything else!
+            Personalized 1-on-1 mentorship by IIT/NIT alumni for IIT-JEE & SAT, plus online/offline home tuitions.
           </p>
         </div>
       </div>
